@@ -6,6 +6,7 @@ import { render } from "@/lib/template";
 
 interface Row {
   email: string;
+  name: string;
   company: string;
   role: string;
 }
@@ -30,17 +31,20 @@ interface HistoryRow {
 }
 
 const DEFAULT_SUBJECT = "Application for {role} at {company}";
-const DEFAULT_BODY = `Dear Hiring Team at {company},
+const DEFAULT_BODY = `Hey!
 
-I am writing to express my interest in the {role} position at {company}. With my background in software development, I am confident I can contribute meaningfully to your team.
+Came across the post regarding Full Stack Developer Role and wanted to reach out.
 
-Please find my resume attached. I would welcome the opportunity to discuss how my skills align with your needs.
+I recently completed my 6-month internship at Myntra (Blr), working on production backend services. Before that, I was at a startup building full-stack stuff with Next.js, GCP, and async event-driven architecture - around ~1.2 years of internship experience across startups and product companies.
 
-Best regards,
-{name}`;
+Comfortable across the JS/TS ecosystem (React, Next.js, Node) and have solid Python and Java experience too.
+
+Resume: https://drive.google.com/file/d/1vdIz71jJ79Dd8XXijlxwbcXqNRiCmzfg/view?usp=sharing
+
+Cheers!`;
 
 function emptyRow(): Row {
-  return { email: "", company: "", role: "" };
+  return { email: "", name: "", company: "", role: "" };
 }
 
 export default function Home() {
@@ -66,7 +70,6 @@ export default function Home() {
   const [history, setHistory] = useState<HistoryRow[]>([]);
 
   const signedIn = status === "authenticated";
-  const senderName = session?.user?.name ?? "";
 
   const loadHistory = async () => {
     try {
@@ -107,13 +110,16 @@ export default function Home() {
       if (!parts[0]) continue;
       parsed.push({
         email: parts[0] ?? "",
-        company: parts[1] ?? "",
-        role: parts[2] ?? "",
+        name: parts[1] ?? "",
+        company: parts[2] ?? "",
+        role: parts[3] ?? "",
       });
     }
     if (parsed.length) {
       setRows((prev) => {
-        const existing = prev.filter((r) => r.email || r.company || r.role);
+        const existing = prev.filter(
+          (r) => r.email || r.name || r.company || r.role
+        );
         return [...existing, ...parsed];
       });
       setCsv("");
@@ -146,7 +152,7 @@ export default function Home() {
   const previewVars = {
     company: validRows[0]?.company || "Acme Corp",
     role: validRows[0]?.role || "Software Developer",
-    name: senderName,
+    name: validRows[0]?.name || "Jane",
     email: validRows[0]?.email || "hr@example.com",
   };
 
@@ -324,12 +330,13 @@ export default function Home() {
                 value={csv}
                 onChange={(e) => setCsv(e.target.value)}
                 rows={4}
-                placeholder={"hr@acme.com, Acme Corp, Full Stack Developer\nhr@globex.com, Globex, Software Developer"}
+                placeholder={"hr@acme.com, Jane, Acme Corp, Full Stack Developer\nhr@globex.com, John, Globex, Software Developer"}
                 className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm font-mono text-slate-900 dark:text-white"
               />
               <p className="text-xs text-slate-400 mt-1">
-                One recipient per line: <b>email, company, role</b> (comma or
-                tab separated). Works with pasted spreadsheet columns.
+                One recipient per line: <b>email, name, company, role</b>{" "}
+                (comma or tab separated). Works with pasted spreadsheet
+                columns.
               </p>
               <button
                 onClick={importCsv}
@@ -345,6 +352,7 @@ export default function Home() {
               <thead>
                 <tr className="text-left text-slate-500">
                   <th className="pb-2 pr-3 font-medium">HR email</th>
+                  <th className="pb-2 pr-3 font-medium">HR name</th>
                   <th className="pb-2 pr-3 font-medium">Company</th>
                   <th className="pb-2 pr-3 font-medium">Role</th>
                   <th className="pb-2 w-8"></th>
@@ -358,6 +366,14 @@ export default function Home() {
                         value={r.email}
                         onChange={(e) => updateRow(i, "email", e.target.value)}
                         placeholder="hr@company.com"
+                        className="w-full rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2 py-1.5 text-slate-900 dark:text-white"
+                      />
+                    </td>
+                    <td className="py-1 pr-3">
+                      <input
+                        value={r.name}
+                        onChange={(e) => updateRow(i, "name", e.target.value)}
+                        placeholder="Jane"
                         className="w-full rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2 py-1.5 text-slate-900 dark:text-white"
                       />
                     </td>

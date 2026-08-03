@@ -2,8 +2,8 @@
  * Tiny placeholder templating. Replaces `{token}` occurrences with values
  * from `vars`. Unknown tokens are left as an empty string.
  *
- * Supported tokens: {company}, {role}, {name}, {email} — plus anything else
- * you pass in.
+ * Supported tokens: {company}, {role}, {name} 
+ * {email} — plus anything else you pass in.
  */
 export function render(template: string, vars: Record<string, string>): string {
   return template.replace(/\{(\w+)\}/g, (_match, key: string) =>

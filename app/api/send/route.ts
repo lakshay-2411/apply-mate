@@ -18,6 +18,7 @@ export const maxDuration = 300;
 
 interface Recipient {
   email: string;
+  name?: string;
   company: string;
   role: string;
 }
@@ -38,7 +39,6 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 export async function POST(req: NextRequest) {
   const session = await auth();
   const userEmail = session?.user?.email;
-  const userName = session?.user?.name ?? "";
   if (!userEmail) {
     return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
   }
@@ -119,7 +119,7 @@ export async function POST(req: NextRequest) {
     const vars = {
       company: r.company ?? "",
       role: r.role ?? "",
-      name: userName,
+      name: r.name ?? "",
       email: r.email ?? "",
     };
     const subject = render(subjectTemplate, vars);
