@@ -25,6 +25,18 @@ interface FollowUpBody {
   delayMs?: number;
 }
 
+/** Streamed NDJSON events, one per line (same shape as /api/send). */
+export type FollowUpEvent =
+  | { type: "start"; total: number }
+  | {
+      type: "result";
+      to: string;
+      subject: string;
+      status: "sent" | "failed";
+      error?: string;
+    }
+  | { type: "done"; sent: number; failed: number };
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Pull the bare address out of a `Name <email>` header for logging. */
@@ -76,58 +88,90 @@ export async function POST(req: NextRequest) {
   const gmail = gmailClientFromRefreshToken(refreshToken);
   const html = textToHtml(message);
   const delayMs = Math.max(0, body.delayMs ?? 1500);
+  const encoder = new TextEncoder();
 
-  const results: Array<{
-    to: string;
-    subject: string;
-    status: "sent" | "failed";
-    error?: string;
-  }> = [];
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const write = (event: FollowUpEvent) =>
+        controller.enqueue(encoder.encode(JSON.stringify(event) + "\n"));
 
-  for (let i = 0; i < targets.length; i++) {
-    const t = targets[i];
-    const subject = replySubject(t.subject ?? "");
+      try {
+        write({ type: "start", total: targets.length });
 
-    if (!t.to?.trim() || !t.threadId || !t.rfcMessageId) {
-      results.push({
-        to: t.to ?? "",
-        subject,
-        status: "failed",
-        error: "Missing reply metadata for this mail",
-      });
-      continue;
-    }
+        let sent = 0;
+        let failed = 0;
 
-    const result = await sendMessage(gmail, {
-      from: userEmail,
-      to: t.to,
-      subject,
-      html,
-      inReplyTo: t.rfcMessageId,
-      threadId: t.threadId,
-    });
+        for (let i = 0; i < targets.length; i++) {
+          const t = targets[i];
+          const subject = replySubject(t.subject ?? "");
 
-    const status = result.ok ? "sent" : "failed";
-    results.push({ to: t.to, subject, status, error: result.error });
+          let status: "sent" | "failed";
+          let errorMsg: string | undefined;
+          let messageId: string | undefined;
 
-    // Log follow-ups alongside regular sends (no campaign).
-    await supabaseAdmin.from("sends").insert({
-      campaign_id: null,
-      user_email: userEmail,
-      to_email: bareEmail(t.to),
-      subject,
-      status,
-      error: result.error ?? null,
-      message_id: result.messageId ?? null,
-      sent_at: result.ok ? new Date().toISOString() : null,
-    });
+          if (!t.to?.trim() || !t.threadId || !t.rfcMessageId) {
+            status = "failed";
+            errorMsg = "Missing reply metadata for this mail";
+          } else {
+            const result = await sendMessage(gmail, {
+              from: userEmail,
+              to: t.to,
+              subject,
+              html,
+              inReplyTo: t.rfcMessageId,
+              threadId: t.threadId,
+            });
+            status = result.ok ? "sent" : "failed";
+            errorMsg = result.error;
+            messageId = result.messageId;
+          }
 
-    // Randomized delay between sends (skip after the last one).
-    if (i < targets.length - 1 && delayMs > 0) {
-      await sleep(delayMs + Math.floor(Math.random() * delayMs));
-    }
-  }
+          if (status === "sent") sent++;
+          else failed++;
 
-  const sent = results.filter((r) => r.status === "sent").length;
-  return NextResponse.json({ sent, failed: results.length - sent, results });
+          write({ type: "result", to: t.to ?? "", subject, status, error: errorMsg });
+
+          // Log follow-ups alongside regular sends (no campaign).
+          await supabaseAdmin.from("sends").insert({
+            campaign_id: null,
+            user_email: userEmail,
+            to_email: bareEmail(t.to ?? ""),
+            subject,
+            status,
+            error: errorMsg ?? null,
+            message_id: messageId ?? null,
+            sent_at: status === "sent" ? new Date().toISOString() : null,
+          });
+
+          // Randomized delay between sends (skip after the last one).
+          if (i < targets.length - 1 && delayMs > 0) {
+            await sleep(delayMs + Math.floor(Math.random() * delayMs));
+          }
+        }
+
+        write({ type: "done", sent, failed });
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Unexpected send error";
+        write({
+          type: "result",
+          to: "",
+          subject: "",
+          status: "failed",
+          error: message,
+        });
+        write({ type: "done", sent: 0, failed: targets.length });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      "X-Accel-Buffering": "no",
+    },
+  });
 }

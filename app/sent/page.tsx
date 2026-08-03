@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import Link from "next/link";
 import { useSession, signIn, signOut } from "next-auth/react";
+import { readNdjsonStream } from "@/lib/ndjson";
+import AppHeader from "../components/AppHeader";
+import { ToastStack, useToasts } from "../components/toasts";
 
 interface SentMail {
   id: string;
@@ -21,7 +23,16 @@ interface FollowUpResult {
   error?: string;
 }
 
+type FollowUpEvent =
+  | { type: "start"; total: number }
+  | ({ type: "result" } & FollowUpResult)
+  | { type: "done"; sent: number; failed: number };
+
 const DEFAULT_AFTER = "2026-07-01";
+
+function daysAgo(n: number): string {
+  return new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+}
 
 function formatDate(value: string): string {
   const d = new Date(value);
@@ -34,8 +45,37 @@ function formatDate(value: string): string {
   });
 }
 
+/** Split a `Name <email>` header into display name + address. */
+function parseTo(to: string): { display: string; email: string } {
+  const m = to.match(/^\s*"?([^"<]*)"?\s*<([^>]+)>/);
+  if (m) return { display: m[1].trim() || m[2].trim(), email: m[2].trim() };
+  return { display: to.trim(), email: to.trim() };
+}
+
+function Spinner() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className="h-4 w-4 animate-spin" aria-hidden>
+      <circle
+        cx="12"
+        cy="12"
+        r="10"
+        stroke="currentColor"
+        strokeOpacity="0.25"
+        strokeWidth="4"
+      />
+      <path
+        d="M22 12a10 10 0 0 0-10-10"
+        stroke="currentColor"
+        strokeWidth="4"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
 export default function SentPage() {
-  const { data: session, status } = useSession();
+  const { status } = useSession();
+  const { toasts, push } = useToasts();
 
   const [after, setAfter] = useState(DEFAULT_AFTER);
   const [mails, setMails] = useState<SentMail[]>([]);
@@ -43,21 +83,32 @@ export default function SentPage() {
   const [loading, setLoading] = useState(false);
   const [needsReauth, setNeedsReauth] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [panelOpen, setPanelOpen] = useState(false);
   const [message, setMessage] = useState("");
   const [delaySec, setDelaySec] = useState(2);
   const [sending, setSending] = useState(false);
+  const [progress, setProgress] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
   const [results, setResults] = useState<FollowUpResult[] | null>(null);
 
   const signedIn = status === "authenticated";
 
-  const load = async (opts?: { append?: boolean; pageToken?: string }) => {
+  const load = async (opts?: {
+    after?: string;
+    append?: boolean;
+    pageToken?: string;
+  }) => {
+    const afterVal = opts?.after ?? after;
     setLoading(true);
     setError(null);
     setNeedsReauth(false);
     try {
-      const params = new URLSearchParams({ after });
+      const params = new URLSearchParams({ after: afterVal });
       if (opts?.pageToken) params.set("pageToken", opts.pageToken);
       const res = await fetch(`/api/sent?${params}`);
       const json = await res.json();
@@ -85,7 +136,26 @@ export default function SentPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signedIn]);
 
-  // ---- Selection ----
+  const applyAfter = (value: string) => {
+    setAfter(value);
+    load({ after: value });
+  };
+
+  const quickFilters = [
+    { label: "Last 7 days", value: daysAgo(7) },
+    { label: "Last 30 days", value: daysAgo(30) },
+    { label: "Since Jul 1", value: DEFAULT_AFTER },
+  ];
+
+  // ---- Search / selection ----
+  const visible = query.trim()
+    ? mails.filter((m) =>
+        `${m.to} ${m.subject} ${m.snippet}`
+          .toLowerCase()
+          .includes(query.trim().toLowerCase())
+      )
+    : mails;
+
   const toggle = (id: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
@@ -94,58 +164,84 @@ export default function SentPage() {
       return next;
     });
   };
-  const allSelected = mails.length > 0 && selected.size === mails.length;
+  const allVisibleSelected =
+    visible.length > 0 && visible.every((m) => selected.has(m.id));
   const toggleAll = () => {
-    setSelected(allSelected ? new Set() : new Set(mails.map((m) => m.id)));
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (allVisibleSelected) visible.forEach((m) => next.delete(m.id));
+      else visible.forEach((m) => next.add(m.id));
+      return next;
+    });
   };
+
+  const selectedMails = mails.filter((m) => selected.has(m.id));
 
   // ---- Follow-up ----
   const sendFollowUp = async () => {
+    if (selectedMails.length === 0 || !message.trim()) return;
     setError(null);
-    setResults(null);
-    const targets = mails
-      .filter((m) => selected.has(m.id))
-      .map((m) => ({
-        threadId: m.threadId,
-        rfcMessageId: m.rfcMessageId,
-        to: m.to,
-        subject: m.subject,
-      }));
-    if (targets.length === 0) {
-      setError("Select at least one mail to follow up on.");
-      return;
-    }
-    if (!message.trim()) {
-      setError("Write a follow-up message first.");
-      return;
-    }
+    setResults([]);
     setSending(true);
+    setProgress({ done: 0, total: selectedMails.length });
     try {
       const res = await fetch("/api/follow-up", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message,
-          targets,
+          targets: selectedMails.map((m) => ({
+            threadId: m.threadId,
+            rfcMessageId: m.rfcMessageId,
+            to: m.to,
+            subject: m.subject,
+          })),
           delayMs: Math.round(delaySec * 1000),
         }),
       });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error ?? "Follow-up failed");
-      setResults(json.results as FollowUpResult[]);
-      setSelected(new Set());
+      if (
+        !res.ok ||
+        (res.headers.get("content-type") ?? "").includes("application/json")
+      ) {
+        const json = await res.json();
+        throw new Error(json.error ?? "Follow-up failed");
+      }
+      await readNdjsonStream<FollowUpEvent>(res, (ev) => {
+        if (ev.type === "start") {
+          setProgress({ done: 0, total: ev.total });
+        } else if (ev.type === "result") {
+          setResults((prev) => [...(prev ?? []), ev]);
+          setProgress((p) => (p ? { ...p, done: p.done + 1 } : p));
+        } else if (ev.type === "done") {
+          push(
+            ev.failed === 0 ? "success" : "error",
+            `Follow-up done — ${ev.sent} sent${ev.failed ? `, ${ev.failed} failed` : ""}`
+          );
+          if (ev.failed === 0) setSelected(new Set());
+        }
+      });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Follow-up failed");
+      const msg = err instanceof Error ? err.message : "Follow-up failed";
+      push("error", msg);
     } finally {
       setSending(false);
+      setProgress(null);
     }
+  };
+
+  const closePanel = () => {
+    if (sending) return;
+    setPanelOpen(false);
+    setResults(null);
   };
 
   // ---------- Rendering ----------
   if (status === "loading") {
     return (
-      <main className="flex-1 grid place-items-center text-slate-500">
-        Loading…
+      <main className="flex-1 grid place-items-center bg-slate-50 dark:bg-slate-950 text-slate-500">
+        <div className="flex items-center gap-2">
+          <Spinner /> Loading…
+        </div>
       </main>
     );
   }
@@ -162,7 +258,7 @@ export default function SentPage() {
           </p>
           <button
             onClick={() => signIn("google")}
-            className="mt-6 w-full rounded-lg bg-slate-900 dark:bg-white text-white dark:text-slate-900 font-medium py-3 hover:opacity-90 transition"
+            className="mt-6 w-full rounded-xl bg-indigo-600 text-white font-medium py-3 hover:bg-indigo-500 transition"
           >
             Connect Google account
           </button>
@@ -172,79 +268,110 @@ export default function SentPage() {
   }
 
   return (
-    <main className="flex-1 bg-slate-50 dark:bg-slate-950">
-      <header className="border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
-        <div className="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <h1 className="font-bold text-lg text-slate-900 dark:text-white">
-              Apply Mate
-            </h1>
-            <nav className="flex items-center gap-3 text-sm">
-              <Link
-                href="/"
-                className="text-slate-500 dark:text-slate-400 hover:underline"
-              >
-                Compose
-              </Link>
-              <span className="font-medium text-slate-900 dark:text-white">
-                Sent &amp; follow-ups
-              </span>
-            </nav>
-          </div>
-          <div className="flex items-center gap-3 text-sm">
-            <span className="text-slate-500 dark:text-slate-400">
-              {session?.user?.email}
-            </span>
-            <button
-              onClick={() => signOut()}
-              className="rounded-md border border-slate-300 dark:border-slate-700 px-3 py-1.5 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
-            >
-              Sign out
-            </button>
-          </div>
-        </div>
-      </header>
+    <main className="flex-1 overflow-x-clip bg-slate-50 dark:bg-slate-950 pb-28">
+      <AppHeader active="sent" />
 
-      <div className="max-w-5xl mx-auto px-6 py-8 grid gap-8">
-        {/* Sent mail list */}
-        <section className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <h2 className="font-semibold text-slate-900 dark:text-white">
-              Sent mail{" "}
-              <span className="text-slate-400 font-normal">
-                ({mails.length}
-                {nextPageToken ? "+" : ""})
-              </span>
-            </h2>
+      <div className="max-w-7xl mx-auto px-6 py-8 grid grid-cols-1 gap-6">
+        {/* Toolbar */}
+        <section className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="relative min-w-56 flex-1">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400"
+              >
+                <circle cx="11" cy="11" r="8" />
+                <path d="m21 21-4.3-4.3" />
+              </svg>
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search loaded mail by recipient or subject…"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 py-2 pl-9 pr-3 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+            </div>
+            <div className="flex items-center gap-1.5">
+              {quickFilters.map((f) => (
+                <button
+                  key={f.label}
+                  onClick={() => applyAfter(f.value)}
+                  disabled={loading}
+                  className={`rounded-full px-3 py-1.5 text-sm transition ${
+                    after === f.value
+                      ? "bg-indigo-600 text-white"
+                      : "border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+                  }`}
+                >
+                  {f.label}
+                </button>
+              ))}
+            </div>
             <div className="flex items-center gap-2 text-sm">
-              <label className="text-slate-600 dark:text-slate-400">
-                Sent after
-              </label>
               <input
                 type="date"
                 value={after}
-                onChange={(e) => setAfter(e.target.value)}
-                className="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2 py-1 text-slate-900 dark:text-white"
+                onChange={(e) => e.target.value && applyAfter(e.target.value)}
+                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2 py-1.5 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
               />
               <button
                 onClick={() => load()}
                 disabled={loading}
-                className="rounded-md bg-slate-900 dark:bg-white text-white dark:text-slate-900 px-3 py-1.5 disabled:opacity-50"
+                title="Refresh"
+                className="grid h-9 w-9 place-items-center rounded-lg border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-50 transition"
               >
-                {loading ? "Loading…" : "Refresh"}
+                {loading ? (
+                  <Spinner />
+                ) : (
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    className="h-4 w-4"
+                  >
+                    <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                    <path d="M21 3v6h-6" />
+                  </svg>
+                )}
               </button>
             </div>
           </div>
-          <p className="text-sm text-slate-500 mt-1">
-            All mail sent from your Gmail account (not just from this app).
-            Select the ones you want to follow up on.
-          </p>
+        </section>
+
+        {/* Mail list */}
+        <section className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+          <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 px-5 py-3">
+            <label className="flex cursor-pointer items-center gap-2.5 text-sm text-slate-600 dark:text-slate-400">
+              <input
+                type="checkbox"
+                checked={allVisibleSelected}
+                onChange={toggleAll}
+                disabled={visible.length === 0}
+                className="h-4 w-4 accent-indigo-600"
+              />
+              Select all{query ? " (matching)" : ""}
+            </label>
+            <span className="text-sm text-slate-400">
+              {visible.length} mail{visible.length === 1 ? "" : "s"}
+              {nextPageToken ? " loaded" : ""}
+              {selected.size > 0 && ` · ${selected.size} selected`}
+            </span>
+          </div>
 
           {needsReauth && (
-            <div className="mt-4 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
+            <div className="m-5 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
               Reading sent mail needs a permission you haven&apos;t granted
               yet.{" "}
-              <button onClick={() => signOut()} className="underline font-medium">
+              <button
+                onClick={() => signOut()}
+                className="font-medium underline"
+              >
                 Sign out
               </button>{" "}
               and sign in again, then approve the &quot;read email&quot;
@@ -253,101 +380,220 @@ export default function SentPage() {
           )}
 
           {error && !needsReauth && (
-            <p className="mt-4 text-sm text-red-600 bg-red-50 dark:bg-red-950/40 rounded-md px-3 py-2">
+            <p className="m-5 rounded-lg bg-red-50 dark:bg-red-950/40 px-3 py-2 text-sm text-red-600">
               {error}
             </p>
           )}
 
-          {mails.length > 0 && (
-            <>
-              <div className="mt-4 flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  id="select-all"
-                  checked={allSelected}
-                  onChange={toggleAll}
-                  className="h-4 w-4 accent-slate-900 dark:accent-white"
-                />
-                <label
-                  htmlFor="select-all"
-                  className="text-slate-600 dark:text-slate-400"
-                >
-                  Select all ({selected.size} selected)
-                </label>
-              </div>
+          {/* Skeletons on first load */}
+          {loading && mails.length === 0 && !needsReauth && (
+            <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+              {Array.from({ length: 6 }).map((_, i) => (
+                <li key={i} className="flex items-center gap-3 px-5 py-3.5">
+                  <div className="h-4 w-4 rounded bg-slate-100 dark:bg-slate-800 animate-pulse" />
+                  <div className="h-9 w-9 rounded-full bg-slate-100 dark:bg-slate-800 animate-pulse" />
+                  <div className="flex-1 space-y-2">
+                    <div className="h-3 w-1/3 rounded bg-slate-100 dark:bg-slate-800 animate-pulse" />
+                    <div className="h-3 w-2/3 rounded bg-slate-100 dark:bg-slate-800 animate-pulse" />
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
 
-              <ul className="mt-3 divide-y divide-slate-100 dark:divide-slate-800">
-                {mails.map((m) => (
-                  <li key={m.id} className="flex items-start gap-3 py-3">
+          {visible.length > 0 && (
+            <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+              {visible.map((m) => {
+                const { display, email } = parseTo(m.to);
+                const checked = selected.has(m.id);
+                return (
+                  <li
+                    key={m.id}
+                    onClick={() => toggle(m.id)}
+                    className={`flex cursor-pointer items-center gap-3 px-5 py-3 transition ${
+                      checked
+                        ? "bg-indigo-50/70 dark:bg-indigo-950/30"
+                        : "hover:bg-slate-50 dark:hover:bg-slate-800/40"
+                    }`}
+                  >
                     <input
                       type="checkbox"
-                      checked={selected.has(m.id)}
+                      checked={checked}
                       onChange={() => toggle(m.id)}
-                      className="mt-1 h-4 w-4 accent-slate-900 dark:accent-white"
+                      onClick={(e) => e.stopPropagation()}
+                      className="h-4 w-4 shrink-0 accent-indigo-600"
                     />
+                    <span
+                      className={`grid h-9 w-9 shrink-0 place-items-center rounded-full text-sm font-semibold ${
+                        checked
+                          ? "bg-indigo-600 text-white"
+                          : "bg-indigo-100 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300"
+                      }`}
+                    >
+                      {(display[0] ?? "?").toUpperCase()}
+                    </span>
                     <div className="min-w-0 flex-1">
                       <div className="flex items-baseline justify-between gap-3">
-                        <span className="truncate font-medium text-slate-900 dark:text-white">
-                          {m.to || "(no recipient)"}
+                        <span
+                          className="truncate font-medium text-slate-900 dark:text-white"
+                          title={email}
+                        >
+                          {display || "(no recipient)"}
                         </span>
                         <span className="shrink-0 text-xs text-slate-400">
                           {formatDate(m.date)}
                         </span>
                       </div>
-                      <div className="truncate text-sm text-slate-700 dark:text-slate-300">
-                        {m.subject || "(no subject)"}
-                      </div>
-                      <div className="truncate text-xs text-slate-400">
-                        {m.snippet}
+                      <div className="truncate text-sm text-slate-600 dark:text-slate-400">
+                        <span className="text-slate-800 dark:text-slate-200">
+                          {m.subject || "(no subject)"}
+                        </span>
+                        {m.snippet && (
+                          <span className="text-slate-400"> — {m.snippet}</span>
+                        )}
                       </div>
                     </div>
                   </li>
-                ))}
-              </ul>
-
-              {nextPageToken && (
-                <button
-                  onClick={() =>
-                    load({ append: true, pageToken: nextPageToken })
-                  }
-                  disabled={loading}
-                  className="mt-3 rounded-md border border-slate-300 dark:border-slate-700 px-3 py-1.5 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-50"
-                >
-                  {loading ? "Loading…" : "Load more"}
-                </button>
-              )}
-            </>
+                );
+              })}
+            </ul>
           )}
+
+          {!loading &&
+            !error &&
+            !needsReauth &&
+            mails.length > 0 &&
+            visible.length === 0 && (
+              <p className="px-5 py-10 text-center text-sm text-slate-500">
+                Nothing matches &quot;{query}&quot; in the loaded mail.
+              </p>
+            )}
 
           {!loading && !error && !needsReauth && mails.length === 0 && (
-            <p className="mt-4 text-sm text-slate-500">
-              No sent mail found after {after}.
-            </p>
+            <div className="px-5 py-14 text-center">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="mx-auto h-10 w-10 text-slate-300 dark:text-slate-700"
+              >
+                <rect width="20" height="16" x="2" y="4" rx="2" />
+                <path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" />
+              </svg>
+              <p className="mt-3 text-sm text-slate-500">
+                No sent mail found after {after}.
+              </p>
+            </div>
+          )}
+
+          {nextPageToken && (
+            <div className="border-t border-slate-100 dark:border-slate-800 p-4 text-center">
+              <button
+                onClick={() => load({ append: true, pageToken: nextPageToken })}
+                disabled={loading}
+                className="rounded-lg border border-slate-300 dark:border-slate-700 px-4 py-2 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-50 transition"
+              >
+                {loading ? "Loading…" : "Load more"}
+              </button>
+            </div>
           )}
         </section>
+      </div>
 
-        {/* Follow-up composer */}
-        <section className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6">
-          <h2 className="font-semibold text-slate-900 dark:text-white">
-            Follow-up message
-          </h2>
-          <p className="text-sm text-slate-500 mt-1">
-            Sent as a reply in each selected conversation — same thread, subject
-            becomes &quot;Re: …&quot;.
-          </p>
+      {/* Sticky selection action bar */}
+      {selected.size > 0 && !panelOpen && (
+        <div className="pointer-events-none fixed inset-x-0 bottom-6 z-30 flex justify-center px-4">
+          <div className="pointer-events-auto flex items-center gap-2 rounded-full bg-slate-900 dark:bg-white py-2 pl-5 pr-2 text-white dark:text-slate-900 shadow-xl">
+            <span className="text-sm font-medium">
+              {selected.size} selected
+            </span>
+            <button
+              onClick={() => setSelected(new Set())}
+              className="ml-1 text-sm text-slate-400 dark:text-slate-500 hover:text-white dark:hover:text-slate-900"
+            >
+              Clear
+            </button>
+            <button
+              onClick={() => {
+                setResults(null);
+                setPanelOpen(true);
+              }}
+              className="ml-2 rounded-full bg-indigo-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-indigo-500 transition"
+            >
+              Write follow-up →
+            </button>
+          </div>
+        </div>
+      )}
 
-          <textarea
-            value={message}
-            onChange={(e) => setMessage(e.target.value)}
-            rows={6}
-            placeholder={
-              "Hi, just following up on my application — happy to share anything else you need. Thanks!"
-            }
-            className="mt-3 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-slate-900 dark:text-white font-mono text-sm focus:outline-none focus:ring-2 focus:ring-slate-400"
-          />
+      {/* Follow-up slide-over */}
+      <div
+        className={`fixed inset-0 z-40 overflow-hidden ${panelOpen ? "" : "pointer-events-none"}`}
+        aria-hidden={!panelOpen}
+      >
+        <div
+          className={`absolute inset-0 bg-black/40 transition-opacity duration-300 ${
+            panelOpen ? "opacity-100" : "opacity-0"
+          }`}
+          onClick={closePanel}
+        />
+        <div
+          className={`absolute inset-y-0 right-0 flex w-full max-w-md flex-col bg-white dark:bg-slate-900 shadow-2xl transition-transform duration-300 ${
+            panelOpen ? "translate-x-0" : "translate-x-full"
+          }`}
+        >
+          <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 px-6 py-4">
+            <h3 className="font-semibold text-slate-900 dark:text-white">
+              Follow-up to {selectedMails.length} thread
+              {selectedMails.length === 1 ? "" : "s"}
+            </h3>
+            <button
+              onClick={closePanel}
+              disabled={sending}
+              className="text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 disabled:opacity-50"
+              title="Close"
+            >
+              ✕
+            </button>
+          </div>
 
-          <div className="mt-4 flex flex-wrap items-center gap-4">
-            <label className="text-sm text-slate-600 dark:text-slate-400">
+          <div className="flex-1 overflow-y-auto px-6 py-4">
+            <div className="flex flex-wrap gap-1.5">
+              {selectedMails.slice(0, 5).map((m) => (
+                <span
+                  key={m.id}
+                  className="max-w-full truncate rounded-full bg-slate-100 dark:bg-slate-800 px-2.5 py-1 text-xs text-slate-600 dark:text-slate-300"
+                >
+                  {parseTo(m.to).display}
+                </span>
+              ))}
+              {selectedMails.length > 5 && (
+                <span className="rounded-full bg-slate-100 dark:bg-slate-800 px-2.5 py-1 text-xs text-slate-400">
+                  +{selectedMails.length - 5} more
+                </span>
+              )}
+            </div>
+
+            <p className="mt-4 text-sm text-slate-500">
+              Sent as a reply in each conversation — same thread, subject
+              becomes &quot;Re: …&quot;.
+            </p>
+
+            <textarea
+              value={message}
+              onChange={(e) => setMessage(e.target.value)}
+              rows={8}
+              disabled={sending}
+              placeholder={
+                "Hi, just following up on my application — happy to share anything else you need. Thanks!"
+              }
+              className="mt-3 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 font-mono text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-60"
+            />
+
+            <label className="mt-3 block text-sm text-slate-600 dark:text-slate-400">
               Delay between emails:{" "}
               <input
                 type="number"
@@ -355,35 +601,43 @@ export default function SentPage() {
                 max={30}
                 value={delaySec}
                 onChange={(e) => setDelaySec(Number(e.target.value))}
-                className="w-16 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2 py-1 text-slate-900 dark:text-white"
+                disabled={sending}
+                className="w-16 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2 py-1 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
               />{" "}
               s
             </label>
-            <button
-              onClick={sendFollowUp}
-              disabled={sending || selected.size === 0 || !message.trim()}
-              className="rounded-lg bg-slate-900 dark:bg-white text-white dark:text-slate-900 font-medium px-6 py-2.5 disabled:opacity-50 hover:opacity-90"
-            >
-              {sending
-                ? "Sending…"
-                : `Send follow-up to ${selected.size} thread${selected.size === 1 ? "" : "s"}`}
-            </button>
-          </div>
 
-          {results && (
-            <div className="mt-4">
-              <div className="text-sm font-medium text-slate-700 dark:text-slate-300">
-                Sent {results.filter((r) => r.status === "sent").length} ·
-                Failed {results.filter((r) => r.status === "failed").length}
+            {sending && progress && (
+              <div className="mt-4">
+                <div className="flex items-center justify-between text-sm text-slate-600 dark:text-slate-400">
+                  <span>
+                    Sending {Math.min(progress.done + 1, progress.total)} of{" "}
+                    {progress.total}…
+                  </span>
+                  <span>
+                    {progress.done}/{progress.total}
+                  </span>
+                </div>
+                <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                  <div
+                    className="h-full rounded-full bg-indigo-600 transition-all duration-500"
+                    style={{
+                      width: `${(progress.done / Math.max(1, progress.total)) * 100}%`,
+                    }}
+                  />
+                </div>
               </div>
-              <ul className="mt-2 space-y-1 text-sm">
+            )}
+
+            {results && results.length > 0 && (
+              <ul className="mt-4 space-y-1 text-sm">
                 {results.map((r, i) => (
                   <li
                     key={i}
-                    className="flex items-center justify-between rounded-md border border-slate-200 dark:border-slate-800 px-3 py-1.5"
+                    className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-1.5"
                   >
                     <span className="truncate text-slate-700 dark:text-slate-300">
-                      {r.to} <span className="text-slate-400">— {r.subject}</span>
+                      {parseTo(r.to).display || "(unknown)"}
                     </span>
                     {r.status === "sent" ? (
                       <span className="shrink-0 text-green-600">✓ sent</span>
@@ -395,10 +649,25 @@ export default function SentPage() {
                   </li>
                 ))}
               </ul>
-            </div>
-          )}
-        </section>
+            )}
+          </div>
+
+          <div className="border-t border-slate-200 dark:border-slate-800 px-6 py-4">
+            <button
+              onClick={sendFollowUp}
+              disabled={sending || selectedMails.length === 0 || !message.trim()}
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 py-2.5 font-medium text-white hover:bg-indigo-500 disabled:opacity-50 disabled:hover:bg-indigo-600 transition"
+            >
+              {sending && <Spinner />}
+              {sending
+                ? "Sending…"
+                : `Send follow-up to ${selectedMails.length} thread${selectedMails.length === 1 ? "" : "s"}`}
+            </button>
+          </div>
+        </div>
       </div>
+
+      <ToastStack toasts={toasts} />
     </main>
   );
 }

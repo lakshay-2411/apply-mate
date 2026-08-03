@@ -33,6 +33,25 @@ interface SendBody {
   delayMs?: number; // base delay between sends
 }
 
+/**
+ * Streamed NDJSON events, one per line:
+ *   { type: "start", total }
+ *   { type: "result", email, company, role, subject, status, error? }
+ *   { type: "done", sent, failed }
+ */
+export type SendEvent =
+  | { type: "start"; total: number }
+  | {
+      type: "result";
+      email: string;
+      company: string;
+      role: string;
+      subject: string;
+      status: "sent" | "failed";
+      error?: string;
+    }
+  | { type: "done"; sent: number; failed: number };
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -88,96 +107,126 @@ export async function POST(req: NextRequest) {
   }
 
   const gmail = gmailClientFromRefreshToken(refreshToken);
-
-  // Record the campaign for history.
-  const { data: campaign } = await supabaseAdmin
-    .from("campaigns")
-    .insert({
-      user_email: userEmail,
-      subject_template: subjectTemplate,
-      body_template: bodyTemplate,
-      resume_path: body.resumePath ?? null,
-      resume_name: body.resumeName ?? null,
-    })
-    .select("id")
-    .single();
-
-  const campaignId = campaign?.id ?? null;
   const delayMs = Math.max(0, body.delayMs ?? 1500);
+  const encoder = new TextEncoder();
 
-  const results: Array<{
-    email: string;
-    company: string;
-    role: string;
-    subject: string;
-    status: "sent" | "failed";
-    error?: string;
-  }> = [];
+  // Stream one NDJSON event per send so the client can show live progress.
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const write = (event: SendEvent) =>
+        controller.enqueue(encoder.encode(JSON.stringify(event) + "\n"));
 
-  for (let i = 0; i < recipients.length; i++) {
-    const r = recipients[i];
-    const vars = {
-      company: r.company ?? "",
-      role: r.role ?? "",
-      name: r.name ?? "",
-      email: r.email ?? "",
-    };
-    const subject = render(subjectTemplate, vars);
-    const html = textToHtml(render(bodyTemplate, vars));
+      try {
+        write({ type: "start", total: recipients.length });
 
-    if (!EMAIL_RE.test(r.email ?? "")) {
-      results.push({
-        email: r.email,
-        company: r.company,
-        role: r.role,
-        subject,
-        status: "failed",
-        error: "Invalid email address",
-      });
-      continue;
-    }
+        // Record the campaign for history.
+        const { data: campaign } = await supabaseAdmin
+          .from("campaigns")
+          .insert({
+            user_email: userEmail,
+            subject_template: subjectTemplate,
+            body_template: bodyTemplate,
+            resume_path: body.resumePath ?? null,
+            resume_name: body.resumeName ?? null,
+          })
+          .select("id")
+          .single();
+        const campaignId = campaign?.id ?? null;
 
-    const result = await sendMessage(gmail, {
-      from: userEmail,
-      to: r.email,
-      subject,
-      html,
-      attachment,
-    });
+        let sent = 0;
+        let failed = 0;
 
-    const status = result.ok ? "sent" : "failed";
-    results.push({
-      email: r.email,
-      company: r.company,
-      role: r.role,
-      subject,
-      status,
-      error: result.error,
-    });
+        for (let i = 0; i < recipients.length; i++) {
+          const r = recipients[i];
+          const vars = {
+            company: r.company ?? "",
+            role: r.role ?? "",
+            name: r.name ?? "",
+            email: r.email ?? "",
+          };
+          const subject = render(subjectTemplate, vars);
+          const html = textToHtml(render(bodyTemplate, vars));
 
-    if (campaignId) {
-      await supabaseAdmin.from("sends").insert({
-        campaign_id: campaignId,
-        user_email: userEmail,
-        to_email: r.email,
-        company: r.company,
-        role: r.role,
-        subject,
-        status,
-        error: result.error ?? null,
-        message_id: result.messageId ?? null,
-        sent_at: result.ok ? new Date().toISOString() : null,
-      });
-    }
+          let status: "sent" | "failed";
+          let errorMsg: string | undefined;
+          let messageId: string | undefined;
 
-    // Randomized delay between sends (skip after the last one).
-    if (i < recipients.length - 1 && delayMs > 0) {
-      await sleep(delayMs + Math.floor(Math.random() * delayMs));
-    }
-  }
+          if (!EMAIL_RE.test(r.email ?? "")) {
+            status = "failed";
+            errorMsg = "Invalid email address";
+          } else {
+            const result = await sendMessage(gmail, {
+              from: userEmail,
+              to: r.email,
+              subject,
+              html,
+              attachment,
+            });
+            status = result.ok ? "sent" : "failed";
+            errorMsg = result.error;
+            messageId = result.messageId;
+          }
 
-  const sent = results.filter((r) => r.status === "sent").length;
-  const failed = results.length - sent;
+          if (status === "sent") sent++;
+          else failed++;
 
-  return NextResponse.json({ sent, failed, results });
+          write({
+            type: "result",
+            email: r.email,
+            company: r.company,
+            role: r.role,
+            subject,
+            status,
+            error: errorMsg,
+          });
+
+          if (campaignId) {
+            await supabaseAdmin.from("sends").insert({
+              campaign_id: campaignId,
+              user_email: userEmail,
+              to_email: r.email,
+              company: r.company,
+              role: r.role,
+              subject,
+              status,
+              error: errorMsg ?? null,
+              message_id: messageId ?? null,
+              sent_at: status === "sent" ? new Date().toISOString() : null,
+            });
+          }
+
+          // Randomized delay between sends (skip after the last one).
+          if (i < recipients.length - 1 && delayMs > 0) {
+            await sleep(delayMs + Math.floor(Math.random() * delayMs));
+          }
+        }
+
+        write({ type: "done", sent, failed });
+      } catch (err) {
+        // Surface unexpected failures as a final failed result.
+        const message =
+          err instanceof Error ? err.message : "Unexpected send error";
+        write({
+          type: "result",
+          email: "",
+          company: "",
+          role: "",
+          subject: "",
+          status: "failed",
+          error: message,
+        });
+        write({ type: "done", sent: 0, failed: recipients.length });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      "X-Accel-Buffering": "no",
+    },
+  });
 }
