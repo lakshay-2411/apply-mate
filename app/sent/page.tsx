@@ -6,14 +6,19 @@ import { readNdjsonStream } from "@/lib/ndjson";
 import AppHeader from "../components/AppHeader";
 import { ToastStack, useToasts } from "../components/toasts";
 
-interface SentMail {
-  id: string;
+/** One sent conversation, grouped server-side by Gmail thread. */
+interface SentThread {
   threadId: string;
+  /** Number of mails you sent in this thread (original + follow-ups). */
+  count: number;
   to: string;
   subject: string;
   date: string;
   snippet: string;
+  /** RFC 822 Message-ID of your latest sent mail — the reply target. */
   rfcMessageId: string;
+  /** True when the thread contains a received mail (they replied). */
+  hasReply: boolean;
 }
 
 interface FollowUpResult {
@@ -78,7 +83,7 @@ export default function SentPage() {
   const { toasts, push } = useToasts();
 
   const [after, setAfter] = useState(DEFAULT_AFTER);
-  const [mails, setMails] = useState<SentMail[]>([]);
+  const [threads, setThreads] = useState<SentThread[]>([]);
   const [nextPageToken, setNextPageToken] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [needsReauth, setNeedsReauth] = useState(false);
@@ -116,8 +121,15 @@ export default function SentPage() {
         if (json.needsReauth) setNeedsReauth(true);
         throw new Error(json.error ?? "Could not load sent mail");
       }
-      setMails((prev) =>
-        opts?.append ? [...prev, ...json.messages] : json.messages
+      setThreads((prev) =>
+        opts?.append
+          ? [
+              ...prev,
+              ...(json.threads as SentThread[]).filter(
+                (t) => !prev.some((p) => p.threadId === t.threadId)
+              ),
+            ]
+          : json.threads
       );
       setNextPageToken(json.nextPageToken);
       if (!opts?.append) setSelected(new Set());
@@ -147,54 +159,55 @@ export default function SentPage() {
     { label: "Since Jul 1", value: DEFAULT_AFTER },
   ];
 
-  // ---- Search / selection ----
-  const visible = query.trim()
-    ? mails.filter((m) =>
-        `${m.to} ${m.subject} ${m.snippet}`
-          .toLowerCase()
-          .includes(query.trim().toLowerCase())
+  // ---- Search / selection (per thread) ----
+  const q = query.trim().toLowerCase();
+  const visible = q
+    ? threads.filter((t) =>
+        `${t.to} ${t.subject} ${t.snippet}`.toLowerCase().includes(q)
       )
-    : mails;
+    : threads;
+  const totalMails = threads.reduce((sum, t) => sum + t.count, 0);
 
-  const toggle = (id: string) => {
+  const toggle = (threadId: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+      if (next.has(threadId)) next.delete(threadId);
+      else next.add(threadId);
       return next;
     });
   };
   const allVisibleSelected =
-    visible.length > 0 && visible.every((m) => selected.has(m.id));
+    visible.length > 0 && visible.every((t) => selected.has(t.threadId));
   const toggleAll = () => {
     setSelected((prev) => {
       const next = new Set(prev);
-      if (allVisibleSelected) visible.forEach((m) => next.delete(m.id));
-      else visible.forEach((m) => next.add(m.id));
+      if (allVisibleSelected) visible.forEach((t) => next.delete(t.threadId));
+      else visible.forEach((t) => next.add(t.threadId));
       return next;
     });
   };
 
-  const selectedMails = mails.filter((m) => selected.has(m.id));
+  const selectedThreads = threads.filter((t) => selected.has(t.threadId));
 
   // ---- Follow-up ----
   const sendFollowUp = async () => {
-    if (selectedMails.length === 0 || !message.trim()) return;
+    if (selectedThreads.length === 0 || !message.trim()) return;
     setError(null);
     setResults([]);
     setSending(true);
-    setProgress({ done: 0, total: selectedMails.length });
+    setProgress({ done: 0, total: selectedThreads.length });
     try {
       const res = await fetch("/api/follow-up", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message,
-          targets: selectedMails.map((m) => ({
-            threadId: m.threadId,
-            rfcMessageId: m.rfcMessageId,
-            to: m.to,
-            subject: m.subject,
+          // Replies target the newest sent mail so Gmail threads them.
+          targets: selectedThreads.map((t) => ({
+            threadId: t.threadId,
+            rfcMessageId: t.rfcMessageId,
+            to: t.to,
+            subject: t.subject,
           })),
           delayMs: Math.round(delaySec * 1000),
         }),
@@ -358,8 +371,9 @@ export default function SentPage() {
               Select all{query ? " (matching)" : ""}
             </label>
             <span className="text-sm text-slate-400">
-              {visible.length} mail{visible.length === 1 ? "" : "s"}
-              {nextPageToken ? " loaded" : ""}
+              {visible.length} conversation{visible.length === 1 ? "" : "s"} (
+              {totalMails} mail{totalMails === 1 ? "" : "s"}
+              {nextPageToken ? " loaded" : ""})
               {selected.size > 0 && ` · ${selected.size} selected`}
             </span>
           </div>
@@ -386,7 +400,7 @@ export default function SentPage() {
           )}
 
           {/* Skeletons on first load */}
-          {loading && mails.length === 0 && !needsReauth && (
+          {loading && threads.length === 0 && !needsReauth && (
             <ul className="divide-y divide-slate-100 dark:divide-slate-800">
               {Array.from({ length: 6 }).map((_, i) => (
                 <li key={i} className="flex items-center gap-3 px-5 py-3.5">
@@ -403,13 +417,13 @@ export default function SentPage() {
 
           {visible.length > 0 && (
             <ul className="divide-y divide-slate-100 dark:divide-slate-800">
-              {visible.map((m) => {
-                const { display, email } = parseTo(m.to);
-                const checked = selected.has(m.id);
+              {visible.map((t) => {
+                const { display, email } = parseTo(t.to);
+                const checked = selected.has(t.threadId);
                 return (
                   <li
-                    key={m.id}
-                    onClick={() => toggle(m.id)}
+                    key={t.threadId}
+                    onClick={() => toggle(t.threadId)}
                     className={`flex cursor-pointer items-center gap-3 px-5 py-3 transition ${
                       checked
                         ? "bg-indigo-50/70 dark:bg-indigo-950/30"
@@ -419,7 +433,7 @@ export default function SentPage() {
                     <input
                       type="checkbox"
                       checked={checked}
-                      onChange={() => toggle(m.id)}
+                      onChange={() => toggle(t.threadId)}
                       onClick={(e) => e.stopPropagation()}
                       className="h-4 w-4 shrink-0 accent-indigo-600"
                     />
@@ -434,22 +448,40 @@ export default function SentPage() {
                     </span>
                     <div className="min-w-0 flex-1">
                       <div className="flex items-baseline justify-between gap-3">
-                        <span
-                          className="truncate font-medium text-slate-900 dark:text-white"
-                          title={email}
-                        >
-                          {display || "(no recipient)"}
+                        <span className="flex min-w-0 items-baseline gap-2">
+                          <span
+                            className="truncate font-medium text-slate-900 dark:text-white"
+                            title={email}
+                          >
+                            {display || "(no recipient)"}
+                          </span>
+                          {t.count > 1 && (
+                            <span
+                              className="shrink-0 rounded-full bg-slate-200 dark:bg-slate-700 px-1.5 text-[11px] font-semibold leading-5 text-slate-600 dark:text-slate-300"
+                              title={`You sent ${t.count} mails in this conversation`}
+                            >
+                              {t.count}
+                            </span>
+                          )}
+                          {t.hasReply && (
+                            <span
+                              className="shrink-0 rounded-full bg-green-100 dark:bg-green-950 px-1.5 text-[11px] font-medium leading-5 text-green-700 dark:text-green-400"
+                              title="This conversation has a reply from them"
+                            >
+                              replied
+                            </span>
+                          )}
                         </span>
                         <span className="shrink-0 text-xs text-slate-400">
-                          {formatDate(m.date)}
+                          {formatDate(t.date)}
                         </span>
                       </div>
                       <div className="truncate text-sm text-slate-600 dark:text-slate-400">
                         <span className="text-slate-800 dark:text-slate-200">
-                          {m.subject || "(no subject)"}
+                          {t.subject || "(no subject)"}
                         </span>
-                        {m.snippet && (
-                          <span className="text-slate-400"> — {m.snippet}</span>
+                        {t.snippet && (
+                          <span className="text-slate-400"> — {t.snippet}</span>
                         )}
                       </div>
                     </div>
@@ -462,14 +494,14 @@ export default function SentPage() {
           {!loading &&
             !error &&
             !needsReauth &&
-            mails.length > 0 &&
+            threads.length > 0 &&
             visible.length === 0 && (
               <p className="px-5 py-10 text-center text-sm text-slate-500">
                 Nothing matches &quot;{query}&quot; in the loaded mail.
               </p>
             )}
 
-          {!loading && !error && !needsReauth && mails.length === 0 && (
+          {!loading && !error && !needsReauth && threads.length === 0 && (
             <div className="px-5 py-14 text-center">
               <svg
                 viewBox="0 0 24 24"
@@ -547,8 +579,8 @@ export default function SentPage() {
         >
           <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 px-6 py-4">
             <h3 className="font-semibold text-slate-900 dark:text-white">
-              Follow-up to {selectedMails.length} thread
-              {selectedMails.length === 1 ? "" : "s"}
+              Follow-up to {selectedThreads.length} thread
+              {selectedThreads.length === 1 ? "" : "s"}
             </h3>
             <button
               onClick={closePanel}
@@ -562,17 +594,17 @@ export default function SentPage() {
 
           <div className="flex-1 overflow-y-auto px-6 py-4">
             <div className="flex flex-wrap gap-1.5">
-              {selectedMails.slice(0, 5).map((m) => (
+              {selectedThreads.slice(0, 5).map((t) => (
                 <span
-                  key={m.id}
+                  key={t.threadId}
                   className="max-w-full truncate rounded-full bg-slate-100 dark:bg-slate-800 px-2.5 py-1 text-xs text-slate-600 dark:text-slate-300"
                 >
-                  {parseTo(m.to).display}
+                  {parseTo(t.to).display}
                 </span>
               ))}
-              {selectedMails.length > 5 && (
+              {selectedThreads.length > 5 && (
                 <span className="rounded-full bg-slate-100 dark:bg-slate-800 px-2.5 py-1 text-xs text-slate-400">
-                  +{selectedMails.length - 5} more
+                  +{selectedThreads.length - 5} more
                 </span>
               )}
             </div>
@@ -655,13 +687,15 @@ export default function SentPage() {
           <div className="border-t border-slate-200 dark:border-slate-800 px-6 py-4">
             <button
               onClick={sendFollowUp}
-              disabled={sending || selectedMails.length === 0 || !message.trim()}
+              disabled={
+                sending || selectedThreads.length === 0 || !message.trim()
+              }
               className="flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 py-2.5 font-medium text-white hover:bg-indigo-500 disabled:opacity-50 disabled:hover:bg-indigo-600 transition"
             >
               {sending && <Spinner />}
               {sending
                 ? "Sending…"
-                : `Send follow-up to ${selectedMails.length} thread${selectedMails.length === 1 ? "" : "s"}`}
+                : `Send follow-up to ${selectedThreads.length} thread${selectedThreads.length === 1 ? "" : "s"}`}
             </button>
           </div>
         </div>

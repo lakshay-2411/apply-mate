@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { getRefreshToken } from "@/lib/supabase";
-import { gmailClientFromRefreshToken, listSentMail } from "@/lib/gmail";
+import { gmailClientFromRefreshToken, listSentThreads } from "@/lib/gmail";
 
 export const runtime = "nodejs";
 
@@ -9,8 +9,8 @@ export const runtime = "nodejs";
 const DEFAULT_AFTER = "2026-07-01";
 
 /**
- * Lists the user's sent Gmail messages (all of them, not just ones sent
- * through this app). Query params:
+ * Lists the user's sent Gmail conversations (all of them, not just ones
+ * sent through this app), one entry per thread. Query params:
  *   - after:     YYYY-MM-DD (defaults to 2026-07-01)
  *   - pageToken: Gmail page token for loading more
  */
@@ -40,12 +40,12 @@ export async function GET(req: NextRequest) {
 
   const gmail = gmailClientFromRefreshToken(refreshToken);
   try {
-    const { messages, nextPageToken } = await listSentMail(gmail, {
+    const { threads, nextPageToken } = await listSentThreads(gmail, {
       after,
       pageToken,
       maxResults: 50,
     });
-    return NextResponse.json({ messages, nextPageToken: nextPageToken ?? null });
+    return NextResponse.json({ threads, nextPageToken: nextPageToken ?? null });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Gmail request failed";
     // The stored refresh token may predate the gmail.readonly scope.

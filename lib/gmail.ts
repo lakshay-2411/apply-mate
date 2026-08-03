@@ -112,16 +112,22 @@ export async function sendMessage(
   }
 }
 
-export interface SentMail {
-  /** Gmail message id (API id, not the RFC 822 header). */
-  id: string;
+export interface SentThread {
   threadId: string;
+  /** Number of mails the user sent in this thread (original + follow-ups). */
+  count: number;
+  /** "To" header of the latest sent mail (may be `Name <email>`). */
   to: string;
+  /** Subject of the first sent mail (the original, without "Re:"). */
   subject: string;
+  /** Date header of the latest sent mail. */
   date: string;
+  /** Snippet of the latest sent mail. */
   snippet: string;
-  /** RFC 822 Message-ID header — needed to thread a reply. */
+  /** RFC 822 Message-ID of the latest sent mail — the reply target. */
   rfcMessageId: string;
+  /** True when the thread contains a received mail (they replied). */
+  hasReply: boolean;
 }
 
 function header(msg: gmail_v1.Schema$Message, name: string): string {
@@ -133,34 +139,36 @@ function header(msg: gmail_v1.Schema$Message, name: string): string {
 }
 
 /**
- * List the user's sent mail (optionally after a date), newest first.
+ * List the user's sent conversations (Gmail threads containing sent mail,
+ * optionally after a date), newest first. Grouping happens at the Gmail
+ * level, so a thread's count is complete regardless of pagination.
  * Requires the gmail.readonly scope.
  */
-export async function listSentMail(
+export async function listSentThreads(
   gmail: gmail_v1.Gmail,
   opts: { after?: string; pageToken?: string; maxResults?: number }
-): Promise<{ messages: SentMail[]; nextPageToken?: string }> {
+): Promise<{ threads: SentThread[]; nextPageToken?: string }> {
   // `after:` accepts YYYY/MM/DD in Gmail search syntax.
   const q = opts.after
     ? `in:sent after:${opts.after.replace(/-/g, "/")}`
     : "in:sent";
 
-  const list = await gmail.users.messages.list({
+  const list = await gmail.users.threads.list({
     userId: "me",
     q,
     maxResults: opts.maxResults ?? 50,
     pageToken: opts.pageToken,
   });
 
-  const ids = (list.data.messages ?? []).map((m) => m.id!).filter(Boolean);
+  const ids = (list.data.threads ?? []).map((t) => t.id!).filter(Boolean);
 
-  // Fetch headers for each message, a few at a time.
-  const messages: SentMail[] = [];
+  // Fetch each thread's message headers, a few threads at a time.
+  const threads: SentThread[] = [];
   const CHUNK = 10;
   for (let i = 0; i < ids.length; i += CHUNK) {
     const chunk = await Promise.all(
       ids.slice(i, i + CHUNK).map((id) =>
-        gmail.users.messages.get({
+        gmail.users.threads.get({
           userId: "me",
           id,
           format: "metadata",
@@ -169,21 +177,29 @@ export async function listSentMail(
       )
     );
     for (const res of chunk) {
-      const msg = res.data;
-      messages.push({
-        id: msg.id ?? "",
-        threadId: msg.threadId ?? "",
-        to: header(msg, "To"),
-        subject: header(msg, "Subject"),
-        date: header(msg, "Date"),
-        snippet: msg.snippet ?? "",
-        rfcMessageId: header(msg, "Message-ID"),
+      const msgs = res.data.messages ?? []; // oldest first
+      const isSent = (m: gmail_v1.Schema$Message) =>
+        m.labelIds?.includes("SENT") ?? false;
+      const isDraft = (m: gmail_v1.Schema$Message) =>
+        m.labelIds?.includes("DRAFT") ?? false;
+      const sent = msgs.filter(isSent);
+      if (sent.length === 0) continue; // defensive: the query implies sent mail
+      const latest = sent[sent.length - 1];
+      threads.push({
+        threadId: res.data.id ?? "",
+        count: sent.length,
+        to: header(latest, "To"),
+        subject: header(sent[0], "Subject"),
+        date: header(latest, "Date"),
+        snippet: latest.snippet ?? "",
+        rfcMessageId: header(latest, "Message-ID"),
+        hasReply: msgs.some((m) => !isSent(m) && !isDraft(m)),
       });
     }
   }
 
   return {
-    messages,
+    threads,
     nextPageToken: list.data.nextPageToken ?? undefined,
   };
 }
