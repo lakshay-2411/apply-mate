@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { useSession, signIn, signOut } from "next-auth/react";
 import { render } from "@/lib/template";
 
@@ -84,7 +85,10 @@ export default function Home() {
   };
 
   useEffect(() => {
-    if (signedIn) loadHistory();
+    if (!signedIn) return;
+    // Deferred so the effect body itself stays free of state updates.
+    const t = setTimeout(() => loadHistory(), 0);
+    return () => clearTimeout(t);
   }, [signedIn]);
 
   // ---- Recipient rows ----
@@ -227,9 +231,22 @@ export default function Home() {
     <main className="flex-1 bg-slate-50 dark:bg-slate-950">
       <header className="border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
         <div className="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">
-          <h1 className="font-bold text-lg text-slate-900 dark:text-white">
-            Apply Mate
-          </h1>
+          <div className="flex items-center gap-4">
+            <h1 className="font-bold text-lg text-slate-900 dark:text-white">
+              Apply Mate
+            </h1>
+            <nav className="flex items-center gap-3 text-sm">
+              <span className="font-medium text-slate-900 dark:text-white">
+                Compose
+              </span>
+              <Link
+                href="/sent"
+                className="text-slate-500 dark:text-slate-400 hover:underline"
+              >
+                Sent &amp; follow-ups
+              </Link>
+            </nav>
+          </div>
           <div className="flex items-center gap-3 text-sm">
             <span className="text-slate-500 dark:text-slate-400">
               {session?.user?.email}

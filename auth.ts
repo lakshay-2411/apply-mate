@@ -10,7 +10,9 @@ import { saveRefreshToken } from "@/lib/supabase";
  * refresh token is persisted to Supabase on first sign-in and later used
  * server-side to mint short-lived access tokens for sending mail.
  */
-const GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send";
+const GMAIL_SCOPE =
+  "https://www.googleapis.com/auth/gmail.send " +
+  "https://www.googleapis.com/auth/gmail.readonly";
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   providers: [

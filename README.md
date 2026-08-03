@@ -46,7 +46,9 @@ npm install
 2. **APIs & Services → Library** → enable the **Gmail API**.
 3. **APIs & Services → OAuth consent screen**:
    - User type: **External**. Fill in the required app info.
-   - Add the scope `https://www.googleapis.com/auth/gmail.send`.
+   - Add the scopes `https://www.googleapis.com/auth/gmail.send` and
+     `https://www.googleapis.com/auth/gmail.readonly` (the latter powers the
+     "Sent & follow-ups" page).
    - Under **Test users**, add your own Gmail address (required while the app
      is in "Testing" mode — otherwise Google blocks sign-in).
 4. **APIs & Services → Credentials → Create credentials → OAuth client ID**:
