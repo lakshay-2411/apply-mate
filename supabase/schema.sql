@@ -24,6 +24,20 @@ create table if not exists campaigns (
   created_at       timestamptz not null default now()
 );
 
+-- Scheduling support: campaigns can be stored now and sent later by the
+-- cron processor. Existing rows (sent immediately) default to 'sent'.
+-- Safe to re-run on an existing database.
+alter table campaigns add column if not exists status       text not null default 'sent';
+  -- 'scheduled' | 'sending' | 'sent' | 'canceled' | 'failed'
+alter table campaigns add column if not exists scheduled_at timestamptz;
+alter table campaigns add column if not exists recipients   jsonb;
+alter table campaigns add column if not exists delay_ms     int;
+alter table campaigns add column if not exists resume_mime  text;
+alter table campaigns add column if not exists error        text;
+
+create index if not exists campaigns_due_idx
+  on campaigns (status, scheduled_at);
+
 -- One row per individual email attempt.
 create table if not exists sends (
   id          uuid primary key default gen_random_uuid(),

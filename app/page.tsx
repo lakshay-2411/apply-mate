@@ -28,6 +28,15 @@ type SendEvent =
   | ({ type: "result" } & SendResult)
   | { type: "done"; sent: number; failed: number };
 
+interface ScheduledCampaign {
+  id: string;
+  subjectTemplate: string;
+  scheduledAt: string;
+  status: string;
+  error: string | null;
+  recipientCount: number;
+}
+
 interface HistoryRow {
   to_email: string;
   company: string | null;
@@ -84,6 +93,42 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** Format a Date for a datetime-local input, in the user's local time. */
+function toLocalInputValue(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function tomorrowAt(hour: number): Date {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  d.setHours(hour, 0, 0, 0);
+  return d;
+}
+
+/** Earliest schedulable moment (a minute from now), for the picker's min. */
+function earliestScheduleValue(): string {
+  return toLocalInputValue(new Date(Date.now() + 60_000));
+}
+
+/** A time is schedulable when it's valid and at least a minute away. */
+function isSchedulableTime(value: string): boolean {
+  const when = new Date(value);
+  return !isNaN(when.getTime()) && when.getTime() - Date.now() >= 60_000;
+}
+
+function formatScheduleTime(iso: string): string {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function formatEta(totalSeconds: number): string {
@@ -171,6 +216,12 @@ export default function Home() {
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const lastBatch = useRef<Row[]>([]);
 
+  const [scheduled, setScheduled] = useState<ScheduledCampaign[]>([]);
+  const [showSchedule, setShowSchedule] = useState(false);
+  const [scheduleAt, setScheduleAt] = useState("");
+  const [scheduleMin, setScheduleMin] = useState("");
+  const [scheduling, setScheduling] = useState(false);
+
   const signedIn = status === "authenticated";
 
   const loadHistory = async () => {
@@ -185,10 +236,25 @@ export default function Home() {
     }
   };
 
+  const loadScheduled = async () => {
+    try {
+      const res = await fetch("/api/schedule");
+      if (res.ok) {
+        const json = await res.json();
+        setScheduled(json.campaigns ?? []);
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+
   useEffect(() => {
     if (!signedIn) return;
     // Deferred so the effect body itself stays free of state updates.
-    const t = setTimeout(() => loadHistory(), 0);
+    const t = setTimeout(() => {
+      loadHistory();
+      loadScheduled();
+    }, 0);
     return () => clearTimeout(t);
   }, [signedIn]);
 
@@ -355,6 +421,62 @@ export default function Home() {
     } finally {
       setSending(false);
       setProgress(null);
+    }
+  };
+
+  // ---- Scheduling ----
+  const openSchedule = () => {
+    setScheduleAt(toLocalInputValue(tomorrowAt(8)));
+    setScheduleMin(earliestScheduleValue());
+    setShowSchedule(true);
+  };
+
+  const scheduleSend = async () => {
+    if (!isSchedulableTime(scheduleAt)) {
+      push("error", "Pick a time at least a minute in the future");
+      return;
+    }
+    setScheduling(true);
+    try {
+      const res = await fetch("/api/schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          subjectTemplate: subject,
+          bodyTemplate: bodyText,
+          recipients: validRows,
+          resumePath: resume?.path,
+          resumeName: resume?.name,
+          resumeMimeType: resume?.mimeType,
+          delayMs: Math.round(delaySec * 1000),
+          scheduledAt: new Date(scheduleAt).toISOString(),
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "Could not schedule");
+      setShowSchedule(false);
+      push(
+        "success",
+        `Scheduled ${validRows.length} email${validRows.length === 1 ? "" : "s"} for ${formatScheduleTime(json.scheduledAt)}`
+      );
+      loadScheduled();
+    } catch (err) {
+      push("error", err instanceof Error ? err.message : "Could not schedule");
+    } finally {
+      setScheduling(false);
+    }
+  };
+
+  const cancelScheduled = async (id: string) => {
+    try {
+      const res = await fetch(`/api/schedule/${id}`, { method: "DELETE" });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "Could not cancel");
+      push("success", "Scheduled send canceled");
+    } catch (err) {
+      push("error", err instanceof Error ? err.message : "Could not cancel");
+    } finally {
+      loadScheduled();
     }
   };
 
@@ -788,6 +910,26 @@ export default function Home() {
                 s
               </label>
               <button
+                onClick={openSchedule}
+                disabled={sending || validRows.length === 0}
+                title="Pick a time — mails go out automatically"
+                className="flex items-center gap-2 rounded-xl border border-indigo-300 dark:border-indigo-800 px-4 py-2.5 font-medium text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 disabled:opacity-50 transition"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="h-4 w-4"
+                >
+                  <circle cx="12" cy="12" r="10" />
+                  <path d="M12 6v6l4 2" />
+                </svg>
+                Schedule send
+              </button>
+              <button
                 onClick={() => setShowConfirm(true)}
                 disabled={sending || validRows.length === 0}
                 className="flex items-center gap-2 rounded-xl bg-indigo-600 text-white font-medium px-6 py-2.5 hover:bg-indigo-500 disabled:opacity-50 disabled:hover:bg-indigo-600 transition"
@@ -870,6 +1012,66 @@ export default function Home() {
           )}
         </section>
 
+        {/* Scheduled sends */}
+        {scheduled.length > 0 && (
+          <section className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6">
+            <h2 className="font-semibold text-slate-900 dark:text-white">
+              Scheduled sends
+            </h2>
+            <p className="text-sm text-slate-500 mt-1">
+              These go out automatically — the app doesn&apos;t need to be
+              open.
+            </p>
+            <ul className="mt-3 divide-y divide-slate-100 dark:divide-slate-800 text-sm">
+              {scheduled.map((c) => (
+                <li
+                  key={c.id}
+                  className="flex flex-wrap items-center justify-between gap-3 py-2.5"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="font-medium text-slate-900 dark:text-white">
+                      {formatScheduleTime(c.scheduledAt)}{" "}
+                      <span className="font-normal text-slate-400">
+                        · {c.recipientCount} recipient
+                        {c.recipientCount === 1 ? "" : "s"}
+                      </span>
+                    </div>
+                    <div className="truncate text-slate-500">
+                      {c.subjectTemplate}
+                    </div>
+                    {c.status === "failed" && c.error && (
+                      <div className="mt-0.5 text-xs text-red-500">
+                        {c.error}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-3">
+                    <span
+                      className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+                        c.status === "scheduled"
+                          ? "bg-indigo-100 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300"
+                          : c.status === "sending"
+                            ? "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-400"
+                            : "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-400"
+                      }`}
+                    >
+                      {c.status}
+                    </span>
+                    {c.status === "scheduled" && (
+                      <button
+                        onClick={() => cancelScheduled(c.id)}
+                        className="text-slate-500 dark:text-slate-400 hover:text-red-500"
+                      >
+                        Cancel
+                      </button>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
         {/* History */}
         {history.length > 0 && (
           <section className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6">
@@ -882,13 +1084,17 @@ export default function Home() {
                   key={i}
                   className="flex items-center justify-between gap-3 py-2"
                 >
-                  <span className="truncate text-slate-600 dark:text-slate-400">
+                  <span className="min-w-0 flex-1 truncate text-slate-600 dark:text-slate-400">
                     <span className="text-slate-900 dark:text-white">
                       {h.to_email}
                     </span>{" "}
                     <span className="text-slate-400">— {h.subject}</span>
+                    {h.status !== "sent" && h.error && (
+                      <span className="text-red-500"> · {h.error}</span>
+                    )}
                   </span>
                   <span
+                    title={h.error ?? undefined}
                     className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-medium ${
                       h.status === "sent"
                         ? "bg-green-100 text-green-700 dark:bg-green-950 dark:text-green-400"
@@ -960,6 +1166,81 @@ export default function Home() {
                 className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 transition"
               >
                 Send now
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Schedule modal */}
+      {showSchedule && (
+        <div
+          className="fixed inset-0 z-40 grid place-items-center bg-black/40 p-4"
+          onClick={() => !scheduling && setShowSchedule(false)}
+        >
+          <div
+            className="w-full max-w-md rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-lg font-semibold text-slate-900 dark:text-white">
+              Schedule send
+            </h3>
+            <p className="mt-1 text-sm text-slate-500">
+              {validRows.length} email{validRows.length === 1 ? "" : "s"}
+              {resume ? ` · "${resume.name}" attached` : ""} — sent
+              automatically at the chosen time.
+            </p>
+
+            <div className="mt-4 flex flex-wrap gap-2">
+              {(
+                [
+                  { label: "Tomorrow 8:00 AM", date: tomorrowAt(8) },
+                  { label: "Tomorrow 1:00 PM", date: tomorrowAt(13) },
+                ] as const
+              ).map((p) => {
+                const value = toLocalInputValue(p.date);
+                return (
+                  <button
+                    key={p.label}
+                    onClick={() => setScheduleAt(value)}
+                    className={`rounded-full px-3 py-1.5 text-sm transition ${
+                      scheduleAt === value
+                        ? "bg-indigo-600 text-white"
+                        : "border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+                    }`}
+                  >
+                    {p.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            <label className="mt-4 block text-sm font-medium text-slate-700 dark:text-slate-300">
+              Or pick a custom time
+            </label>
+            <input
+              type="datetime-local"
+              value={scheduleAt}
+              min={scheduleMin}
+              onChange={(e) => setScheduleAt(e.target.value)}
+              className={`mt-1 ${inputCls}`}
+            />
+
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                onClick={() => setShowSchedule(false)}
+                disabled={scheduling}
+                className="rounded-lg border border-slate-300 dark:border-slate-700 px-4 py-2 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-50 transition"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={scheduleSend}
+                disabled={scheduling || !scheduleAt}
+                className="flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-50 transition"
+              >
+                {scheduling && <Spinner />}
+                {scheduling ? "Scheduling…" : "Schedule"}
               </button>
             </div>
           </div>

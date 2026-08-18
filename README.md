@@ -67,6 +67,8 @@ Fill in `.env.local`:
 - `AUTH_SECRET` — generate with `npx auth secret`
 - `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` — from step 3
 - `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` — from step 2
+- `CRON_SECRET` — any long random string (e.g. `openssl rand -hex 32`);
+  protects the `/api/cron` endpoint that fires scheduled sends
 
 ### 5. Run
 
@@ -78,6 +80,39 @@ Open <http://localhost:3000>, click **Connect Google account**, grant the
 "send email" permission, and start sending.
 
 ---
+
+## Scheduled sends
+
+Campaigns can be scheduled from the compose page ("Schedule send"). The
+mail data is stored in Supabase and a processor sends it when the time
+comes — the browser doesn't need to stay open.
+
+**Existing databases:** re-run [`supabase/schema.sql`](supabase/schema.sql)
+in the Supabase SQL Editor once — it adds the scheduling columns (the
+statements are idempotent).
+
+Two things can trigger the processor (both are safe to run together —
+campaigns are claimed atomically, so nothing double-sends):
+
+1. **While the app's server is running** (local `npm run dev` / `npm start`):
+   a background poller checks every minute automatically. Nothing to set up.
+2. **When your machine may be off**: deploy the app (e.g. Vercel) and let a
+   cron hit `GET /api/cron` with the header
+   `Authorization: Bearer <CRON_SECRET>`.
+   - On **Vercel**, [`vercel.json`](vercel.json) already schedules it every
+     5 minutes — just set the `CRON_SECRET` env var in the project settings
+     (Vercel attaches the header automatically). Note: the Hobby plan limits
+     how often crons run (daily); Pro allows minute-level schedules. Also set
+     `AUTH_*` / `SUPABASE_*` env vars and add your production callback URL in
+     Google Cloud.
+   - Any other scheduler (GitHub Actions, cron-job.org, a Raspberry Pi
+     crontab…) works the same way: `curl -H "Authorization: Bearer $CRON_SECRET" https://your-app/api/cron`
+   - On a long-running host (e.g. **Render**), the in-app poller from (1)
+     already runs — you only need to keep the service awake. Point any free
+     uptime pinger (cron-job.org, UptimeRobot) at `GET /api/health` every
+     5–10 minutes; no secret required for that endpoint.
+3. A campaign whose time passed while nothing was running is sent on the
+   next processor run ("as soon as possible", like Gmail).
 
 ## Notes & limits
 
