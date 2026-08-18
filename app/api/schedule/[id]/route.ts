@@ -5,8 +5,9 @@ import { supabaseAdmin } from "@/lib/supabase";
 export const runtime = "nodejs";
 
 /**
- * Cancel a scheduled campaign. Only campaigns still in 'scheduled' state
- * can be canceled — once the processor claims one it's already sending.
+ * Cancel a scheduled campaign, or dismiss a failed one from the list.
+ * Campaigns that are actively 'sending' can't be touched — once the
+ * processor claims one it's already going out.
  */
 export async function DELETE(
   _req: NextRequest,
@@ -25,7 +26,7 @@ export async function DELETE(
     .update({ status: "canceled" })
     .eq("id", id)
     .eq("user_email", userEmail)
-    .eq("status", "scheduled")
+    .in("status", ["scheduled", "failed"])
     .select("id")
     .maybeSingle();
 

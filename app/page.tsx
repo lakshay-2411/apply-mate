@@ -217,6 +217,9 @@ export default function Home() {
   const lastBatch = useRef<Row[]>([]);
 
   const [scheduled, setScheduled] = useState<ScheduledCampaign[]>([]);
+  const [activityTab, setActivityTab] = useState<"scheduled" | "recent">(
+    "scheduled"
+  );
   const [showSchedule, setShowSchedule] = useState(false);
   const [scheduleAt, setScheduleAt] = useState("");
   const [scheduleMin, setScheduleMin] = useState("");
@@ -467,12 +470,12 @@ export default function Home() {
     }
   };
 
-  const cancelScheduled = async (id: string) => {
+  const cancelScheduled = async (id: string, wasFailed: boolean) => {
     try {
       const res = await fetch(`/api/schedule/${id}`, { method: "DELETE" });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? "Could not cancel");
-      push("success", "Scheduled send canceled");
+      push("success", wasFailed ? "Removed from the list" : "Scheduled send canceled");
     } catch (err) {
       push("error", err instanceof Error ? err.message : "Could not cancel");
     } finally {
@@ -1012,74 +1015,109 @@ export default function Home() {
           )}
         </section>
 
-        {/* Scheduled sends */}
-        {scheduled.length > 0 && (
+        {/* Activity: scheduled + recent sends in one card */}
+        {(scheduled.length > 0 || history.length > 0) && (
           <section className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6">
-            <h2 className="font-semibold text-slate-900 dark:text-white">
-              Scheduled sends
-            </h2>
-            <p className="text-sm text-slate-500 mt-1">
-              These go out automatically — the app doesn&apos;t need to be
-              open.
-            </p>
-            <ul className="mt-3 divide-y divide-slate-100 dark:divide-slate-800 text-sm">
-              {scheduled.map((c) => (
-                <li
-                  key={c.id}
-                  className="flex flex-wrap items-center justify-between gap-3 py-2.5"
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="font-medium text-slate-900 dark:text-white">
-                      {formatScheduleTime(c.scheduledAt)}{" "}
-                      <span className="font-normal text-slate-400">
-                        · {c.recipientCount} recipient
-                        {c.recipientCount === 1 ? "" : "s"}
-                      </span>
-                    </div>
-                    <div className="truncate text-slate-500">
-                      {c.subjectTemplate}
-                    </div>
-                    {c.status === "failed" && c.error && (
-                      <div className="mt-0.5 text-xs text-red-500">
-                        {c.error}
-                      </div>
-                    )}
-                  </div>
-                  <div className="flex shrink-0 items-center gap-3">
-                    <span
-                      className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                        c.status === "scheduled"
-                          ? "bg-indigo-100 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300"
-                          : c.status === "sending"
-                            ? "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-400"
-                            : "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-400"
-                      }`}
-                    >
-                      {c.status}
-                    </span>
-                    {c.status === "scheduled" && (
-                      <button
-                        onClick={() => cancelScheduled(c.id)}
-                        className="text-slate-500 dark:text-slate-400 hover:text-red-500"
-                      >
-                        Cancel
-                      </button>
-                    )}
-                  </div>
-                </li>
-              ))}
-            </ul>
-          </section>
-        )}
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => setActivityTab("scheduled")}
+                className={`rounded-full px-3 py-1.5 text-sm transition ${
+                  activityTab === "scheduled"
+                    ? "bg-indigo-600 text-white"
+                    : "text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+                }`}
+              >
+                Scheduled ({scheduled.length})
+              </button>
+              <button
+                onClick={() => setActivityTab("recent")}
+                className={`rounded-full px-3 py-1.5 text-sm transition ${
+                  activityTab === "recent"
+                    ? "bg-indigo-600 text-white"
+                    : "text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+                }`}
+              >
+                Recent sends
+              </button>
+            </div>
 
-        {/* History */}
-        {history.length > 0 && (
-          <section className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6">
-            <h2 className="font-semibold text-slate-900 dark:text-white">
-              Recent sends
-            </h2>
-            <ul className="mt-3 divide-y divide-slate-100 dark:divide-slate-800 text-sm">
-              {history.slice(0, 20).map((h, i) => (
+            {activityTab === "scheduled" && (
+              <>
+                <p className="text-sm text-slate-500 mt-3">
+                  These go out automatically — the app doesn&apos;t need to be
+                  open.
+                </p>
+                {scheduled.length === 0 ? (
+                  <p className="mt-3 text-sm text-slate-400">
+                    Nothing scheduled right now.
+                  </p>
+                ) : (
+                  <ul className="mt-2 max-h-96 divide-y divide-slate-100 dark:divide-slate-800 overflow-y-auto text-sm">
+                    {scheduled.map((c) => (
+                      <li
+                        key={c.id}
+                        className="flex flex-wrap items-center justify-between gap-3 py-2.5"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="font-medium text-slate-900 dark:text-white">
+                            {formatScheduleTime(c.scheduledAt)}{" "}
+                            <span className="font-normal text-slate-400">
+                              · {c.recipientCount} recipient
+                              {c.recipientCount === 1 ? "" : "s"}
+                            </span>
+                          </div>
+                          <div className="truncate text-slate-500">
+                            {c.subjectTemplate}
+                          </div>
+                          {c.status === "failed" && c.error && (
+                            <div className="mt-0.5 text-xs text-red-500">
+                              {c.error}
+                            </div>
+                          )}
+                        </div>
+                        <div className="flex shrink-0 items-center gap-3">
+                          <span
+                            className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+                              c.status === "scheduled"
+                                ? "bg-indigo-100 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300"
+                                : c.status === "sending"
+                                  ? "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-400"
+                                  : "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-400"
+                            }`}
+                          >
+                            {c.status}
+                          </span>
+                          {c.status === "scheduled" && (
+                            <button
+                              onClick={() => cancelScheduled(c.id, false)}
+                              className="text-slate-500 dark:text-slate-400 hover:text-red-500"
+                            >
+                              Cancel
+                            </button>
+                          )}
+                          {c.status === "failed" && (
+                            <button
+                              onClick={() => cancelScheduled(c.id, true)}
+                              title="Remove from this list"
+                              className="text-slate-400 hover:text-red-500"
+                            >
+                              ✕
+                            </button>
+                          )}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </>
+            )}
+
+            {activityTab === "recent" &&
+              (history.length === 0 ? (
+                <p className="mt-3 text-sm text-slate-400">No sends yet.</p>
+              ) : (
+                <ul className="mt-3 max-h-96 divide-y divide-slate-100 dark:divide-slate-800 overflow-y-auto text-sm">
+                  {history.slice(0, 20).map((h, i) => (
                 <li
                   key={i}
                   className="flex items-center justify-between gap-3 py-2"
@@ -1103,9 +1141,10 @@ export default function Home() {
                   >
                     {h.status}
                   </span>
-                </li>
+                    </li>
+                  ))}
+                </ul>
               ))}
-            </ul>
           </section>
         )}
       </div>
