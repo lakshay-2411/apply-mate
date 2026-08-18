@@ -6,6 +6,7 @@ import { useSession, signOut } from "next-auth/react";
 const TABS = [
   { key: "compose", href: "/", label: "Compose" },
   { key: "sent", href: "/sent", label: "Sent & follow-ups" },
+  { key: "verify", href: "/verify", label: "Email verifier" },
 ] as const;
 
 export type TabKey = (typeof TABS)[number]["key"];
